@@ -46,8 +46,8 @@ HACKRF_LNA_GAIN = 32
 HACKRF_MIN_SCAN_MHZ = 40
 HACKRF_MAX_SCAN_MHZ = 2000
 MODULE_DESCRIPTION = "spectrum module"
-REPORTER_QSIZE_LIMIT = 1e6
-REPORTER_SLEEP = 1/250 # so as not to saturate the server
+REPORTER_QSIZE_LIMIT = 10e6
+REPORTER_SLEEP = 1/2000  # limit data rate to server
 RTLSDR_CROP = 20  # %
 RTLSDR_INTEGRATION_INTERVAL = 3
 RTLSDR_WINDOW = "hamming"
@@ -141,11 +141,12 @@ class Reporter(Process):
         self.socket.sendto(json.dumps(data), (self.server_host, self.server_port))
 
 
-class RtlSpectrum(threading.Thread):
+class Spectrum(threading.Thread):
     def __init__(self, spectrum_opts, reporter, reporter_queue, gpsp, devmod, parent):
         threading.Thread.__init__(self)
 
         self.devnum = spectrum_opts['devnum']
+        self.sdrtype = spectrum_opts['sdrtype']
         self.reporter = reporter
         self.reporter_queue = reporter_queue
         self.gpsp = gpsp
@@ -155,15 +156,29 @@ class RtlSpectrum(threading.Thread):
 
         cmd = spectrum_opts['cmd']
         fstr = spectrum_opts['fstr']
-        integration = spectrum_opts['integration']
-        gain = spectrum_opts['gain']
-        ppm = spectrum_opts['ppm']
 
         ON_POSIX = 'posix' in builtin_module_names 
-        self.cmdpipe = Popen([cmd, "-d {}".format(self.devnum), "-f {}".format(fstr),
-                "-i {}".format(integration), "-p {}".format(ppm), "-g {}".format(gain),
-                "-c {}%".format(RTLSDR_CROP), "-w {}".format(RTLSDR_WINDOW)],
-                stdout=PIPE, stderr=STDOUT, close_fds=ON_POSIX)
+
+        if self.sdrtype == 'rtlsdr':
+            integration = spectrum_opts['integration']
+            gain = spectrum_opts['gain']
+            ppm = spectrum_opts['ppm']
+
+            self.cmdpipe = Popen([cmd, "-d {}".format(self.devnum), "-f {}".format(fstr),
+                    "-i {}".format(integration), "-p {}".format(ppm), "-g {}".format(gain),
+                    "-c {}%".format(RTLSDR_CROP), "-w {}".format(RTLSDR_WINDOW)],
+                    stdout=PIPE, stderr=STDOUT, close_fds=ON_POSIX)
+
+        elif self.sdrtype == 'hackrf':
+            width = spectrum_opts['width']
+            lna_gain = spectrum_opts['lna_gain']
+            vga_gain = spectrum_opts['vga_gain']
+
+            DEVNULL = open(os.devnull, 'w')
+
+            self.cmdpipe = Popen([cmd, "-f{}".format(fstr), "-w {}".format(width),
+                "-l {}".format(lna_gain), "-g {}".format(vga_gain)],
+                stdout=PIPE, stderr=DEVNULL, close_fds=ON_POSIX)
 
         self.stoprequest = threading.Event()
 
@@ -176,7 +191,7 @@ class RtlSpectrum(threading.Thread):
             if len(data) == 0:
                 try:
                     continue
-                except Exception:
+                except:
                     return
 
             # look for gps here to avoid flooding the reporter in the case of no lock
@@ -190,12 +205,13 @@ class RtlSpectrum(threading.Thread):
                 if len(raw) == 0:
                     continue
 
-                if len(raw.split(' ')[0].split('-')) != 3:  # line irrelevant, or from stderr
-                    if raw == "Error: dropped samples.":
-                        print("[spectrum] Error with device {}, exiting task".format(self.devnum))
-                        self.devmod.removedev(self.devnum)
-                        return
-                    continue
+                if self.sdrtype == 'rtlsdr':
+                    if len(raw.split(' ')[0].split('-')) != 3:  # line irrelevant, or from stderr
+                        if raw == "Error: dropped samples.":
+                            print("[spectrum] Error with device {}, exiting task".format(self.devnum))
+                            self.devmod.removedev(self.devnum)
+                            return
+                        continue
 
                 try:
                     _date, _time, freq_low, freq_high, step, _samples, raw_readings = raw.split(', ', 6)
@@ -203,7 +219,7 @@ class RtlSpectrum(threading.Thread):
                     step = float(step)
                     readings = [x.strip() for x in raw_readings.split(',')]
 
-                except:
+                except Exception:
                     print("[spectrum] Thread exiting on exception")
                     return
 
@@ -211,99 +227,10 @@ class RtlSpectrum(threading.Thread):
                 for i in range(len(readings)):
                     freq = int(round(freq_low + (step * i)))
                     pwr = float(readings[i])
-                    self.reporter_queue.put( ("data", (freq, pwr, loc, ct, step) ) )
-
-            check_q += 1
-            if check_q >= CHECK_QUEUE_INTERVAL:
-                qsize = self.reporter_queue.qsize()
-                if qsize > REPORTER_QSIZE_LIMIT:
-                    print("[spectrum] WARINING: Queue filling up too fast!  Run spectrum over less bandwidth.")
-                    self.overflow = True
-                    break
-                check_q = 0
-
-        self.cmdpipe.stdout.close()
-        self.cmdpipe.kill()
-        os.kill(self.cmdpipe.pid, 9)
-        os.wait()
-
-        if self.overflow:
-            self.parent.stop(self.devnum, self.devmod)
-        
-        return
-
-    def join(self, timeout=None):
-        self.stoprequest.set()
-        super(RtlSpectrum, self).join(timeout)
-
-
-class HackRFSpectrum(threading.Thread):
-    def __init__(self, spectrum_opts, reporter, reporter_queue, gpsp, devmod, parent):
-        threading.Thread.__init__(self)
-
-        self.devnum = spectrum_opts['devnum']
-        self.reporter = reporter
-        self.reporter_queue = reporter_queue
-        self.gpsp = gpsp
-        self.devmod = devmod
-        self.parent = parent
-        self.overflow = False
-        cmd = spectrum_opts['cmd']
-        fstr = spectrum_opts['fstr']
-        width = spectrum_opts['width']
-        lna_gain = spectrum_opts['lna_gain']
-        vga_gain = spectrum_opts['vga_gain']
-
-        ON_POSIX = 'posix' in builtin_module_names 
-        DEVNULL = open(os.devnull, 'w')
-        self.cmdpipe = Popen([cmd, "-f{}".format(fstr), "-w {}".format(width),
-            "-l {}".format(lna_gain), "-g {}".format(vga_gain)],
-            stdout=PIPE, stderr=DEVNULL, close_fds=ON_POSIX)
-
-        self.stoprequest = threading.Event()
-
-    def run(self):
-        check_q = 0
-
-        while not self.stoprequest.isSet():
-            data = self.cmdpipe.stdout.readline()
-
-            if len(data) == 0:
-                continue
-
-            # look for gps here to avoid flooding the reporter in the case of no lock
-            loc = self.gpsp.get_current()
-            if (loc == None) or (loc['lat'] == "0.0" and loc['lng'] == "0.0") or (loc['lat'] == "NaN"):
-                print("[spectrum] No GPS loc, waiting...")
-                time.sleep(ERROR_SLEEP)
-                continue
-
-            for raw in data.split('\n'):
-                if len(raw) == 0:
-                    continue
-
-                try:
-                    _date, _time, freq_low, freq_high, step, _samples, raw_readings = raw.split(', ', 6)
-                    freq_low = float(freq_low)
-                    step = float(step)
-                    readings = [x.strip() for x in raw_readings.split(',')]
-
-                except Exception:
-                    print("[spectrum] Thread exiting on exception")
-                    return
-
-                ct = int(time.time())
-                for i in range(len(readings)):
-                    freq = int(round(freq_low + (step * i)))
-                    try:
-                        pwr = float(readings[i])
-                    except:
-                        continue
-
                     try:
                         self.reporter_queue.put( ("data", (freq, pwr, loc, ct, step) ) )
-                    except:
-                        pass  # when exiting
+                    except AssertionError:  # can happen while exiting
+                        continue
 
             check_q += 1
             if check_q >= CHECK_QUEUE_INTERVAL:
@@ -313,7 +240,6 @@ class HackRFSpectrum(threading.Thread):
                     self.overflow = True
                     break
                 check_q = 0
-
 
         self.cmdpipe.stdout.close()
         self.cmdpipe.kill()
@@ -327,7 +253,7 @@ class HackRFSpectrum(threading.Thread):
 
     def join(self, timeout=None):
         self.stoprequest.set()
-        super(HackRFSpectrum, self).join(timeout)
+        super(Spectrum, self).join(timeout)
 
 
 class GrfModuleSpectrum(GrfModuleBase):
@@ -410,7 +336,6 @@ class GrfModuleSpectrum(GrfModuleBase):
                 print("Error parsing frequency string")
                 return
 
-
             if outfreqs[1] < outfreqs[0]:
                 print("Second scan frequency must be greater than the first scan frequency")
                 return
@@ -422,9 +347,8 @@ class GrfModuleSpectrum(GrfModuleBase):
                     'fstr': fstr,
                     'integration': RTLSDR_INTEGRATION_INTERVAL,
                     'ppm': devmod.get_ppm(devnum),
-                    'gain': devmod.get_gain(devnum)}
-
-            spectrum = RtlSpectrum(spectrum_opts, self.reporter, self.reporter_queue, self.gpsworker, devmod, self)
+                    'gain': devmod.get_gain(devnum),
+                    'sdrtype': 'rtlsdr'}
 
         elif devtype == "hackrf":
             try:
@@ -471,10 +395,10 @@ class GrfModuleSpectrum(GrfModuleBase):
                     'fstr': fstr,
                     'width': width,
                     'lna_gain': devmod.get_lna_gain(devnum),
-                    'vga_gain': devmod.get_vga_gain(devnum)}
+                    'vga_gain': devmod.get_vga_gain(devnum),
+                    'sdrtype': 'hackrf'}
 
-            spectrum = HackRFSpectrum(spectrum_opts, self.reporter, self.reporter_queue, self.gpsworker, devmod, self)
-
+        spectrum = Spectrum(spectrum_opts, self.reporter, self.reporter_queue, self.gpsworker, devmod, self)
         spectrum.daemon = True
         spectrum.start()
         self.spectrum_workers.append( (devnum, spectrum) )
@@ -492,7 +416,7 @@ class GrfModuleSpectrum(GrfModuleBase):
 
     def shutdown(self):
         print("Shutting down spectrum module(s)")
-        try:  # if no module is running, this will cause an error
+        try:  # if this module has not yet been run, this will cause an error
             self.reporter_queue.put( ("stop", (None) ) )
         except:
             pass
