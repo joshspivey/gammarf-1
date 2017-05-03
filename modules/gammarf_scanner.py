@@ -110,7 +110,11 @@ class Scanner(threading.Thread):
                     print("[scanner] Could not get interesting freqs from the server: {}".format(e))
                     time.sleep(ERROR_SLEEP)
                 else:
-                    tmp = json.loads(response)
+                    try:
+                        tmp = json.loads(response)
+                    except ValueError:
+                        continue
+
                     if tmp['reply'] == 'ok':
                         tmpfreqs = [ int(f) for f in tmp['freqs'] ]
 
